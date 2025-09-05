@@ -1,4 +1,4 @@
-// index.js — NewEra Daily Submission Bot (Panel Version, with diagnostics)
+// index.js — NewEra Daily Submission Bot (Panel + full member fetch + diagnostics)
 
 import 'dotenv/config';
 import {
@@ -22,9 +22,9 @@ const GUILD_ID = process.env.GUILD_ID?.trim();
 const TZ = 'America/Detroit';
 const DATA_FILE = './data.json';
 
-console.log('ENV check → TOKEN len:', TOKEN?.length || 0, '| GUILD_ID:', GUILD_ID);
-if (!TOKEN) console.error('🚫 DISCORD_TOKEN is missing.');
-if (!GUILD_ID || !/^\d{10,}$/.test(GUILD_ID)) console.error('🚫 GUILD_ID missing/invalid. Must be a numeric Server ID.');
+console.log('ENV → TOKEN len:', TOKEN?.length || 0, '| GUILD_ID:', GUILD_ID);
+if (!TOKEN) console.error('🚫 DISCORD_TOKEN missing.');
+if (!GUILD_ID || !/^\d{10,}$/.test(GUILD_ID)) console.error('🚫 GUILD_ID missing/invalid.');
 
 // ===== DATA PERSISTENCE =====
 function todayISO() {
@@ -52,7 +52,7 @@ function ensureToday(d) {
     d.currentDate = t;
     d.completed = [];
     saveData(d);
-    console.log(`🔁 New day detected (${t}) — reset completed list.`);
+    console.log(`🔁 New day (${t}) — reset completed list.`);
   }
 }
 
@@ -60,6 +60,7 @@ const data = loadData();
 ensureToday(data);
 
 // ===== DISCORD CLIENT =====
+// IMPORTANT: In the Developer Portal → Bot tab → turn ON "SERVER MEMBERS INTENT".
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
@@ -90,33 +91,54 @@ const commands = [
     description: 'Post the control panel message in this channel (admin).',
     default_member_permissions: String(PermissionFlagsBits.ManageGuild),
   },
+  {
+    name: 'refresh',
+    description: 'Recount members & refresh the panel (admin).',
+    default_member_permissions: String(PermissionFlagsBits.ManageGuild),
+  },
 ];
 
-// ===== HELPERS =====
-function getGangMembers(guild) {
+// ===== HELPERS (async, full member fetch) =====
+async function getGangMembersAsync(guild) {
   if (!data.gangRoleId) return null;
-  const role = guild.roles.cache.get(data.gangRoleId);
+
+  // fetch ALL members → fills guild.members.cache (requires Server Members Intent ON)
+  await guild.members.fetch();
+
+  const role = await guild.roles.fetch(data.gangRoleId).catch(() => null);
   if (!role) return null;
-  return role.members; // Collection<Snowflake, GuildMember>
+
+  // exclude bots from counts
+  const membersWithRole = guild.members.cache.filter(
+    (m) => m.roles.cache.has(role.id) && !m.user.bot
+  );
+
+  return membersWithRole; // Collection<Snowflake, GuildMember>
 }
-function isGangMember(member) {
-  if (!data.gangRoleId) return true; // allow until configured
-  return member.roles.cache.has(data.gangRoleId);
-}
-function summarize(guild) {
+
+async function summarizeAsync(guild) {
   ensureToday(data);
-  const members = getGangMembers(guild);
+  const members = await getGangMembersAsync(guild);
   if (!members) {
     return { total: null, doneCount: data.completed.length, remainingCount: null, remaining: [] };
   }
+
   const total = members.size;
   const doneSet = new Set(data.completed);
+
   const remaining = members
     .filter((m) => !doneSet.has(m.id))
     .map((m) => m)
     .sort((a, b) => a.displayName.localeCompare(b.displayName));
-  return { total, doneCount: Math.min(doneSet.size, total), remainingCount: remaining.length, remaining };
+
+  return {
+    total,
+    doneCount: Math.min(doneSet.size, total),
+    remainingCount: remaining.length,
+    remaining,
+  };
 }
+
 function panelComponents() {
   return [
     new ActionRowBuilder().addComponents(
@@ -128,12 +150,14 @@ function panelComponents() {
     ),
   ];
 }
-function panelEmbed(guild) {
-  const { total, doneCount, remainingCount } = summarize(guild);
+
+function panelEmbedWithStats(stats) {
+  const { total, doneCount, remainingCount } = stats;
   const lines =
     total !== null
       ? [`**Done:** ${doneCount}/${total}`, `**Remaining:** ${remainingCount}`]
       : [`**Done:** ${doneCount}`, `*(Set a gang role with /setgangrole)*`];
+
   return new EmbedBuilder()
     .setTitle('NewEra Daily Submission Panel')
     .setDescription(`Submit your **1000 bud** for **${data.currentDate}**.\n${lines.join('\n')}`)
@@ -141,21 +165,21 @@ function panelEmbed(guild) {
     .setTimestamp();
 }
 
-// ===== COMMAND REGISTRATION (with diagnostics + fallback) =====
+// ===== COMMAND REGISTRATION (guild + diagnostics) =====
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const app = await client.application.fetch();
   console.log('🆔 App ID:', app.id, '| GUILD_ID:', GUILD_ID);
 
-  // 1) Clear guild commands to avoid stale cache
+  // Clear guild commands to avoid stale cache
   await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: [] });
   console.log('🧹 Cleared old guild commands');
 
-  // 2) Register guild commands (fast)
+  // Register guild commands (fast)
   await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
   console.log('✅ Registered GUILD commands:', commands.map((c) => c.name).join(', '));
 
-  // 3) Diagnostics: read back what exists
+  // Read back for diagnostics
   const guildCmds = await rest.get(Routes.applicationGuildCommands(app.id, GUILD_ID));
   console.log('🔎 Guild commands now on server:', guildCmds.map((c) => c.name));
 }
@@ -163,6 +187,7 @@ async function registerCommands() {
 // ===== READY =====
 client.once('ready', async () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
+
   try {
     await registerCommands();
   } catch (e) {
@@ -181,12 +206,14 @@ client.once('ready', async () => {
   // Auto-reset checker
   setInterval(() => ensureToday(data), 60 * 1000);
 
-  // Refresh panel on restart if we still have its IDs
+  // Refresh stored panel on restart
   if (data.panelChannelId && data.panelMessageId) {
     try {
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const stats = await summarizeAsync(guild);
       const ch = await client.channels.fetch(data.panelChannelId);
       const msg = await ch.messages.fetch(data.panelMessageId);
-      await msg.edit({ embeds: [panelEmbed(msg.guild)], components: panelComponents() });
+      await msg.edit({ embeds: [panelEmbedWithStats(stats)], components: panelComponents() });
       console.log('♻️ Panel refreshed after restart');
     } catch {
       console.log('ℹ️ Panel not found (maybe deleted). Use /panel again if needed.');
@@ -217,51 +244,58 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (id === 'btn_done') {
-      if (!isGangMember(member)) {
+      if (!data.gangRoleId) {
+        return interaction.reply({ content: '❌ Set a gang role first: **/setgangrole**', ephemeral: true });
+      }
+      if (!member.roles.cache.has(data.gangRoleId)) {
         return interaction.reply({ content: '❌ You don’t have the required gang role.', ephemeral: true });
       }
+
       if (!data.completed.includes(member.id)) {
         data.completed.push(member.id);
         saveData(data);
       }
+
       try {
         if (data.panelChannelId && data.panelMessageId) {
+          const stats = await summarizeAsync(interaction.guild);
           const ch = await interaction.guild.channels.fetch(data.panelChannelId);
           const msg = await ch.messages.fetch(data.panelMessageId);
-          await msg.edit({ embeds: [panelEmbed(interaction.guild)], components: panelComponents() });
+          await msg.edit({ embeds: [panelEmbedWithStats(stats)], components: panelComponents() });
         }
       } catch {}
       return interaction.reply({ content: `✅ Marked **DONE** for ${data.currentDate}.`, ephemeral: true });
     }
 
     if (id === 'btn_status') {
-      const { total, doneCount, remainingCount } = summarize(interaction.guild);
+      const stats = await summarizeAsync(interaction.guild);
       const text =
-        total !== null
-          ? `**Done:** ${doneCount}/${total}\n**Remaining:** ${remainingCount}`
-          : `**Done:** ${doneCount}\n*(Set a gang role with /setgangrole)*`;
+        stats.total !== null
+          ? `**Done:** ${stats.doneCount}/${stats.total}\n**Remaining:** ${stats.remainingCount}`
+          : `**Done:** ${stats.doneCount}\n*(Set a gang role with /setgangrole)*`;
       return interaction.reply({ content: text, ephemeral: true });
     }
 
     if (id === 'btn_remaining') {
-      const { remaining } = summarize(interaction.guild);
+      const { remaining } = await summarizeAsync(interaction.guild);
       if (!remaining) return interaction.reply({ content: 'Set a gang role with **/setgangrole** first.', ephemeral: true });
       const list = remaining.length ? remaining.map((m) => `${m}`).join('\n') : 'Everyone is done. 🎉';
       return interaction.reply({ content: list, ephemeral: true });
     }
 
     if (id === 'btn_ping') {
-      if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+      const asMember = await interaction.guild.members.fetch(interaction.user.id);
+      if (!asMember.permissions.has(PermissionFlagsBits.ManageGuild)) {
         return interaction.reply({ content: '❌ Admins only (Manage Server).', ephemeral: true });
       }
-      const { remaining } = summarize(interaction.guild);
+      const { remaining } = await summarizeAsync(interaction.guild);
       if (!remaining) return interaction.reply({ content: 'Set a gang role with **/setgangrole** first.', ephemeral: true });
       if (!remaining.length) return interaction.reply({ content: 'Everyone is done. 🎉', ephemeral: true });
       const mentions = remaining.map((m) => `${m}`).join(' ');
       return interaction.reply({ content: `⏰ Daily check: ${mentions}\nPlease submit your 1000 bud and press **I’m Done**.` });
     }
 
-    return; // end button handling
+    return; // end buttons
   }
 
   // SLASH COMMANDS
@@ -271,13 +305,16 @@ client.on('interactionCreate', async (interaction) => {
     const role = interaction.options.getRole('role');
     data.gangRoleId = role.id;
     saveData(data);
+
     try {
       if (data.panelChannelId && data.panelMessageId) {
+        const stats = await summarizeAsync(interaction.guild);
         const ch = await interaction.guild.channels.fetch(data.panelChannelId);
         const msg = await ch.messages.fetch(data.panelMessageId);
-        await msg.edit({ embeds: [panelEmbed(interaction.guild)], components: panelComponents() });
+        await msg.edit({ embeds: [panelEmbedWithStats(stats)], components: panelComponents() });
       }
     } catch {}
+
     return interaction.reply({ content: `✅ Gang role set to **${role.name}**.`, ephemeral: true });
   }
 
@@ -285,44 +322,54 @@ client.on('interactionCreate', async (interaction) => {
     data.currentDate = todayISO();
     data.completed = [];
     saveData(data);
+
     try {
       if (data.panelChannelId && data.panelMessageId) {
+        const stats = await summarizeAsync(interaction.guild);
         const ch = await interaction.guild.channels.fetch(data.panelChannelId);
         const msg = await ch.messages.fetch(data.panelMessageId);
-        await msg.edit({ embeds: [panelEmbed(interaction.guild)], components: panelComponents() });
+        await msg.edit({ embeds: [panelEmbedWithStats(stats)], components: panelComponents() });
       }
     } catch {}
+
     return interaction.reply({ content: '♻️ Today’s checklist has been reset.', ephemeral: true });
   }
 
   if (interaction.commandName === 'done') {
+    if (!data.gangRoleId) {
+      return interaction.reply({ content: '❌ Set a gang role first: **/setgangrole**', ephemeral: true });
+    }
     const member = await interaction.guild.members.fetch(interaction.user.id);
-    if (!isGangMember(member)) {
+    if (!member.roles.cache.has(data.gangRoleId)) {
       return interaction.reply({ content: '❌ You don’t have the required gang role.', ephemeral: true });
     }
+
     if (!data.completed.includes(member.id)) {
       data.completed.push(member.id);
       saveData(data);
     }
+
     try {
       if (data.panelChannelId && data.panelMessageId) {
+        const stats = await summarizeAsync(interaction.guild);
         const ch = await interaction.guild.channels.fetch(data.panelChannelId);
         const msg = await ch.messages.fetch(data.panelMessageId);
-        await msg.edit({ embeds: [panelEmbed(interaction.guild)], components: panelComponents() });
+        await msg.edit({ embeds: [panelEmbedWithStats(stats)], components: panelComponents() });
       }
     } catch {}
+
     return interaction.reply({ content: `✅ You’re marked as done for **${data.currentDate}**.`, ephemeral: true });
   }
 
   if (interaction.commandName === 'status') {
-    const { total, doneCount, remainingCount, remaining } = summarize(interaction.guild);
-    const remainingPreview = remaining?.slice(0, 20).map((m) => `• ${m}`).join('\n') || '—';
+    const stats = await summarizeAsync(interaction.guild);
+    const remainingPreview = stats.remaining?.slice(0, 20).map((m) => `• ${m}`).join('\n') || '—';
     const embed = new EmbedBuilder()
       .setTitle(`Today’s Progress (${data.currentDate})`)
       .setDescription(
-        total
-          ? `**Done:** ${doneCount}/${total}\n**Remaining:** ${remainingCount}`
-          : `**Done:** ${doneCount}\n*(Set a gang role with **/setgangrole**)*`,
+        stats.total !== null
+          ? `**Done:** ${stats.doneCount}/${stats.total}\n**Remaining:** ${stats.remainingCount}`
+          : `**Done:** ${stats.doneCount}\n*(Set a gang role with **/setgangrole**)*`,
       )
       .addFields({ name: 'Remaining (first 20)', value: remainingPreview })
       .setTimestamp();
@@ -330,7 +377,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.commandName === 'remaining') {
-    const { remaining } = summarize(interaction.guild);
+    const { remaining } = await summarizeAsync(interaction.guild);
     if (!remaining) return interaction.reply({ content: 'Set a gang role with **/setgangrole** first.', ephemeral: true });
     const list = remaining.length ? remaining.map((m) => `${m}`).join('\n') : 'Everyone is done. 🎉';
     return interaction.reply({ content: list, ephemeral: true });
@@ -341,7 +388,7 @@ client.on('interactionCreate', async (interaction) => {
     if (!member.permissions.has(PermissionFlagsBits.ManageGuild)) {
       return interaction.reply({ content: '❌ Admins only (Manage Server).', ephemeral: true });
     }
-    const { remaining } = summarize(interaction.guild);
+    const { remaining } = await summarizeAsync(interaction.guild);
     if (!remaining) return interaction.reply({ content: 'Set a gang role with **/setgangrole** first.', ephemeral: true });
     if (!remaining.length) return interaction.reply({ content: 'Everyone is done. 🎉', ephemeral: true });
     const mentions = remaining.map((m) => `${m}`).join(' ');
@@ -349,13 +396,26 @@ client.on('interactionCreate', async (interaction) => {
   }
 
   if (interaction.commandName === 'panel') {
-    const embed = panelEmbed(interaction.guild);
+    const stats = await summarizeAsync(interaction.guild);
+    const embed = panelEmbedWithStats(stats);
     const components = panelComponents();
     const sent = await interaction.channel.send({ embeds: [embed], components });
     data.panelMessageId = sent.id;
     data.panelChannelId = sent.channel.id;
     saveData(data);
     return interaction.reply({ content: '✅ Panel posted. Consider pinning it.', ephemeral: true });
+  }
+
+  if (interaction.commandName === 'refresh') {
+    const stats = await summarizeAsync(interaction.guild);
+    if (data.panelChannelId && data.panelMessageId) {
+      try {
+        const ch = await interaction.guild.channels.fetch(data.panelChannelId);
+        const msg = await ch.messages.fetch(data.panelMessageId);
+        await msg.edit({ embeds: [panelEmbedWithStats(stats)], components: panelComponents() });
+      } catch {}
+    }
+    return interaction.reply({ content: '✅ Panel refreshed & members recounted.', ephemeral: true });
   }
 });
 
