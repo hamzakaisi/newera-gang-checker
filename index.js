@@ -19,7 +19,7 @@ import express from 'express';
 // ===== ENV & CONSTANTS =====
 const TOKEN = process.env.DISCORD_TOKEN?.trim();
 const GUILD_ID = process.env.GUILD_ID?.trim();
-const TZ = 'America/Detroit';
+const TZ = 'Asia/Riyadh';
 const DATA_FILE = './data.json';
 
 console.log('ENV → TOKEN len:', TOKEN?.length || 0, '| GUILD_ID:', GUILD_ID);
@@ -161,7 +161,7 @@ function panelEmbedWithStats(stats) {
   return new EmbedBuilder()
     .setTitle('NewEra Daily Submission Panel')
     .setDescription(`Submit your **1000 bud** for **${data.currentDate}**.\n${lines.join('\n')}`)
-    .setFooter({ text: 'Click “I’m Done” after you submit. Auto-resets daily (America/Detroit).' })
+    .setFooter({ text: `Click “I’m Done” after you submit. Auto-resets daily (${TZ}).` })
     .setTimestamp();
 }
 
